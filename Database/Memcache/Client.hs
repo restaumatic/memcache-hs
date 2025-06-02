@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE TypeApplications #-}
 
 {-|
 Module      : Database.Memcache.Client
@@ -90,6 +91,7 @@ module Database.Memcache.Client (
         get, gat, touch,
 
         getFirst,
+        setAll,
 
         -- ** Set operations
         set, cas, add, replace,
@@ -113,10 +115,10 @@ import           Database.Memcache.Server
 import           Database.Memcache.Socket
 import           Database.Memcache.Types   hiding (cas)
 
-#if __GLASGOW_HASKELL__ < 710
-import           Control.Applicative
-#endif
-import           Control.Exception         (SomeException, handle, throwIO)
+
+
+
+import           Control.Exception         (SomeException (SomeException), handle, throwIO, try)
 import           Control.Monad             (forM_, void, when)
 import           Data.ByteString           (ByteString)
 import qualified Data.ByteString           as B (null)
@@ -168,9 +170,7 @@ getFirst c k = do
     let msg = emptyReq { reqOp = ReqGet Loud NoKey k }
 
     let loop (s:rest) firstException = do
-          er <-
-            handle (\e -> pure (Left (e :: SomeException))) $
-            Right <$> serverOp c s msg
+          er <- try @SomeException $ serverOp c s msg
           case er of
             Left exception ->
               -- Server failed - fallback to next, remember the exception
@@ -182,7 +182,8 @@ getFirst c k = do
                   (ErrKeyNotFound, _) ->
                     -- Key not found - fallback to the next server
                     loop rest firstException
-                  _ -> throwIO $ wrongOp r "GET"
+                  _ ->
+                    loop rest (firstException <|> Just (SomeException (wrongOp r "GET")))
         loop [] (Just firstException) = throwIO firstException
         loop [] Nothing = pure Nothing
 
@@ -190,6 +191,23 @@ getFirst c k = do
     if null servers
       then throwIO $ ClientError NoServersReady
       else loop servers Nothing
+
+-- | Set all key-value pairs in the cluster to the given value, returning a list of
+-- results, one for each currently alive server in the cluster. The results
+-- are either the version identifier of the key-value pair at the server, or an
+-- exception if the operation failed. The key-value pairs are set with the
+-- given flags and expiration time. Use an expiration value of @0@ to store
+-- forever.
+setAll :: Cluster -> Key -> Value -> Flags -> Expiration -> IO [Either SomeException Version]
+setAll c k v f e = do
+  let msg = emptyReq { reqOp = ReqSet Loud k v (SESet f e) }
+  let singleSet s = do
+        r <- serverOp c s msg
+        when (resOp r /= ResSet Loud) $ throwIO $ wrongOp r "SET"
+        case resStatus r of
+            NoError -> return $ resCas r
+            rs      -> throwStatus rs
+  fmap snd <$> allOp' c (try @SomeException . singleSet)
 
 -- | Get-and-touch: Retrieve the value for the given key from Memcached, and
 -- also update the stored key-value pairs expiration time at the server. Use an
