@@ -18,7 +18,7 @@ module Database.Memcache.Socket (
         Socket, Request(..), Response(..),
 
         -- * Operations
-        send, recv,
+        send, sendMany, recv,
 
         -- * Serialization / Deserialization
         szRequest, szResponse, dzHeader, dzResponse
@@ -47,6 +47,11 @@ import qualified Network.Socket.ByteString as N
 send :: Socket -> Request -> IO ()
 {-# INLINE send #-}
 send s m = N.sendAll s (toByteString $ szRequest m)
+
+-- | Send several requests to the Memcached server in one write.
+sendMany :: Socket -> [Request] -> IO ()
+{-# INLINE sendMany #-}
+sendMany s ms = N.sendAll s (toByteString $ foldMap szRequest ms)
 
 -- | Retrieve a single response from the Memcached server.
 -- FIXME: read into buffer to minimize read syscalls
