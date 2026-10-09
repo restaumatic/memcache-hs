@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns     #-}
 {-# LANGUAGE TypeApplications #-}
 
 {-|
@@ -91,7 +92,9 @@ module Database.Memcache.Client (
         get, gat, touch,
 
         getFirst,
+        getFirstMulti,
         setAll,
+        setAllMulti,
 
         -- ** Set operations
         set, cas, add, replace,
@@ -119,9 +122,14 @@ import           Database.Memcache.Types   hiding (cas)
 
 
 import           Control.Exception         (SomeException (SomeException), handle, throwIO, try)
-import           Control.Monad             (forM_, void, when)
+import           Control.Monad             (forM, forM_, void, when)
 import           Data.ByteString           (ByteString)
 import qualified Data.ByteString           as B (null)
+import           Data.Either               (isRight, lefts, rights)
+import           Data.List                 (nub)
+import           Data.Map.Strict           (Map)
+import qualified Data.Map.Strict           as Map
+import           Data.Maybe                (listToMaybe)
 import           Data.Default.Class
 import           Data.Word
 import Control.Applicative ((<|>))
@@ -208,6 +216,84 @@ setAll c k v f e = do
             NoError -> return $ resCas r
             rs      -> throwStatus rs
   fmap snd <$> allOp' c (try @SomeException . singleSet)
+
+-- | Retrieve the values for many keys. Each key is asked from the servers in
+-- the order 'getFirst' uses, and a key that is missing on one server is asked
+-- from the next one. The keys for one server are sent as a pipeline of quiet
+-- gets, 'multiChunkSize' keys per round trip.
+--
+-- * Keys that no server has are left out of the result.
+-- * A server whose request fails is skipped, as in 'getFirst'. The first
+--   exception is thrown when no server answered.
+getFirstMulti :: Cluster -> [Key] -> IO (Map Key (Value, Flags, Version))
+getFirstMulti _ [] = pure Map.empty
+getFirstMulti c ks = do
+    servers <- getAliveServers c
+    when (null servers) $ throwIO $ ClientError NoServersReady
+    go [(k, orderServersForKey servers k) | k <- nub ks] Map.empty Nothing False
+  where
+    go routes found firstException answered
+      | null pending = case firstException of
+          Just e | not answered -> throwIO e
+          _                     -> pure found
+      | otherwise = do
+          let byServer = Map.toList $ Map.fromListWith (flip (<>)) [(s, [k]) | (k, s : _) <- pending]
+          results <- forM byServer $ \(s, keys) ->
+            try @SomeException $ Map.unions <$> mapM (getChunk s) (chunksOf multiChunkSize keys)
+          let found' = Map.unions (found : rights results)
+          go
+            [(k, rest) | (k, _ : rest) <- pending, Map.notMember k found']
+            found'
+            (firstException <|> listToMaybe (lefts results))
+            (answered || any isRight results)
+      where
+        pending = filter (not . null . snd) routes
+
+    getChunk s keys = serverOp' c s $ withSocket s $ \sock -> do
+        sendMany sock $ [emptyReq { reqOp = ReqGet Quiet IncludeKey k } | k <- keys] <> [emptyReq]
+        let collect !acc = do
+              r <- recv sock
+              case (resStatus r, resOp r) of
+                (NoError, ResNoop)            -> pure acc
+                (NoError, ResGetK Quiet k v f) -> collect (Map.insert k (v, f, resCas r) acc)
+                _                             -> throwIO $ wrongOp r "GETKQ"
+        collect Map.empty
+
+-- | Set many key-value pairs on every alive server, like 'setAll'. The pairs
+-- are sent as a pipeline of quiet sets, 'multiChunkSize' pairs per round trip.
+--
+-- Returns one result per server: the keys that the server didn't store, with
+-- their status, or the exception if the request failed.
+setAllMulti :: Cluster -> [(Key, Value, Flags, Expiration)] -> IO [Either SomeException [(Key, Status)]]
+setAllMulti _ [] = pure []
+setAllMulti c items = do
+    servers <- getAliveServers c
+    when (null servers) $ throwIO $ ClientError NoServersReady
+    forM servers $ \s ->
+      try @SomeException $ concat <$> mapM (setChunk s) (chunksOf multiChunkSize (zip [0 ..] items))
+  where
+    setChunk s chunk = serverOp' c s $ withSocket s $ \sock -> do
+        sendMany sock $
+          [emptyReq { reqOp = ReqSet Quiet k v (SESet f e), reqOpaque = i } | (i, (k, v, f, e)) <- chunk]
+            <> [emptyReq]
+        let keys = Map.fromList [(i, k) | (i, (k, _, _, _)) <- chunk]
+            collect acc = do
+              r <- recv sock
+              case resOp r of
+                ResNoop | resStatus r == NoError -> pure (reverse acc)
+                ResSet Quiet | Just k <- Map.lookup (resOpaque r) keys -> collect ((k, resStatus r) : acc)
+                _ -> throwIO $ wrongOp r "SETQ"
+        collect []
+
+-- | Requests per round trip in 'getFirstMulti' and 'setAllMulti'. A bounded
+-- pipeline keeps the server from blocking on writing responses while the
+-- client is still sending requests.
+multiChunkSize :: Int
+multiChunkSize = 100
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 -- | Get-and-touch: Retrieve the value for the given key from Memcached, and
 -- also update the stored key-value pairs expiration time at the server. Use an
