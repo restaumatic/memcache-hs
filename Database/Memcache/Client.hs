@@ -237,7 +237,7 @@ getFirstMulti c ks = do
           Just e | not answered -> throwIO e
           _                     -> pure found
       | otherwise = do
-          let byServer = Map.toList $ Map.fromListWith (flip (<>)) [(s, [k]) | (k, s : _) <- pending]
+          let byServer = Map.toList $ Map.fromListWith (<>) [(s, [k]) | (k, s : _) <- pending]
           results <- forM byServer $ \(s, keys) ->
             try @SomeException $ Map.unions <$> mapM (getChunk s) (chunksOf multiChunkSize keys)
           let found' = Map.unions (found : rights results)
