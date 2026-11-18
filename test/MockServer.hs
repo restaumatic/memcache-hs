@@ -4,7 +4,7 @@
 
 -- | Mock Memcached server - just enough for testing client.
 module MockServer (
-        MockResponse(..), mockMCServer, withMCServer
+        MockResponse(..), mockMCServer, withMCServer, withMCServerOn
     ) where
 
 import           Database.Memcache.Socket
@@ -38,20 +38,23 @@ data MockResponse
 -- | Run an IO action with a mock Memcached server running in the background,
 -- killing it once done.
 withMCServer :: Bool -> [MockResponse] -> IO () -> IO ()
-withMCServer loop res m = do
+withMCServer = withMCServerOn "11211"
+
+withMCServerOn :: N.ServiceName -> Bool -> [MockResponse] -> IO () -> IO ()
+withMCServerOn port loop res m = do
   sem <- newEmptyMVar
 
   let waitForInitialization = takeMVar sem
 
   bracket
-    (mockMCServer loop res sem)
+    (mockMCServer port loop res sem)
     (\tid -> killThread tid >> threadDelay 100000)
     (const $ waitForInitialization >> m)
 
 -- | New mock Memcached server that responds to each request with the specified
 -- list of responses.
-mockMCServer :: Bool -> [MockResponse] -> MVar () -> IO ThreadId
-mockMCServer loop resp' sem = forkIO $ bracket
+mockMCServer :: N.ServiceName -> Bool -> [MockResponse] -> MVar () -> IO ThreadId
+mockMCServer port loop resp' sem = forkIO $ bracket
     (N.socket N.AF_INET N.Stream N.defaultProtocol)
     N.close
     $ \sock -> do
@@ -61,7 +64,7 @@ mockMCServer loop resp' sem = forkIO $ bracket
           , N.addrSocketType = N.Stream
           , N.addrFamily = N.AF_INET
         }
-        addr:_ <- N.getAddrInfo (Just hints) Nothing (Just "11211")
+        addr:_ <- N.getAddrInfo (Just hints) Nothing (Just port)
         N.bind sock $ N.addrAddress addr
         N.listen sock 10
         ref <- newIORef resp'

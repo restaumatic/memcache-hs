@@ -27,7 +27,10 @@ module Database.Memcache.Cluster (
         Retries, keyedOp, anyOp, allOp, allOp',
         
         getServersForKey,
-        serverOp
+        orderServersForKey,
+        getAliveServers,
+        serverOp,
+        serverOp'
     ) where
 
 import           Database.Memcache.Errors
@@ -41,7 +44,7 @@ import           Data.Default.Class
 import           Data.Fixed               (Milli)
 import           Data.Hashable            (hash)
 import           Data.IORef
-import           Data.List                (sort)
+import           Data.List                (partition, sort)
 import           Data.Maybe               (fromMaybe)
 import           Data.Time.Clock          (NominalDiffTime)
 import           Data.Time.Clock.POSIX    (getPOSIXTime)
@@ -170,18 +173,33 @@ getServerForKeyDefault  c k = do
 -- We use consistent hashing based on the CHORD approach.
 getServersForKey :: Cluster -> Key -> IO [Server]
 {-# INLINE getServersForKey #-}
-getServersForKey  c k = do
-    let hashedKey = hash k
+getServersForKey c k = (`orderServersForKey` k) <$> getAliveServers c
+
+-- | The given servers in the order 'getServersForKey' uses for this key.
+orderServersForKey :: [Server] -> Key -> [Server]
+orderServersForKey servers k = after <> before
+  where
+    hashedKey = hash k
+    (before, after) = partition (\s -> sid s < hashedKey) servers
+
+-- | The servers not currently marked as failed, ordered by 'sid'.
+getAliveServers :: Cluster -> IO [Server]
+getAliveServers c = do
     servers <- getServers c
-    servers' <- V.filterM (serverAlive $ cDeadDelay c) servers
-    let (before, after) = V.partition (\s -> sid s < hashedKey) servers'
-    return $ V.toList $ after <> before
+    V.toList <$> V.filterM (serverAlive $ cDeadDelay c) servers
 
 -- | Run a Memcached operation against a particular server, handling any
 -- failures that occur, retrying the specified number of times.
 serverOp :: Cluster -> Server -> Request -> IO Response
 {-# INLINE serverOp #-}
 serverOp c s req = retryOp c s $ sendRecv s req
+
+-- | Like 'serverOp', for an IO action that talks to the server itself, e.g.
+-- through 'withSocket'. The action runs again on a retry, so it has to be
+-- idempotent.
+serverOp' :: Cluster -> Server -> IO a -> IO a
+{-# INLINE serverOp' #-}
+serverOp' = retryOp
 
 -- | Run a Memcached operation against a particular server, handling any
 -- failures that occur, retrying the specified number of times.

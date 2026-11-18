@@ -18,7 +18,7 @@ module Database.Memcache.Socket (
         Socket, Request(..), Response(..),
 
         -- * Operations
-        send, recv,
+        send, sendMany, recv,
 
         -- * Serialization / Deserialization
         szRequest, szResponse, dzHeader, dzResponse
@@ -47,6 +47,11 @@ import qualified Network.Socket.ByteString as N
 send :: Socket -> Request -> IO ()
 {-# INLINE send #-}
 send s m = N.sendAll s (toByteString $ szRequest m)
+
+-- | Send several requests to the Memcached server in one write.
+sendMany :: Socket -> [Request] -> IO ()
+{-# INLINE sendMany #-}
+sendMany s ms = N.sendAll s (toByteString $ foldMap szRequest ms)
 
 -- | Retrieve a single response from the Memcached server.
 -- FIXME: read into buffer to minimize read syscalls
@@ -83,7 +88,7 @@ szResponse res =
     <> fromWord16be (fromIntegral keyl)
     <> fromWord8 (fromIntegral extl)
     <> fromWord8 0
-    <> fromWord16be 0
+    <> fromWord16be (szStatus $ resStatus res)
     <> fromWord32be (fromIntegral $ extl + keyl + vall)
     <> fromWord32be (resOpaque res)
     <> fromWord64be (resCas res)
@@ -405,6 +410,20 @@ dzStatus = do
         0x20 -> SaslAuthFail
         0x21 -> SaslAuthContinue
         _    -> throw $ ProtocolError UnknownStatus { protocolError = show st }
+
+szStatus :: Status -> Word16
+szStatus st = case st of
+    NoError            -> 0x00
+    ErrKeyNotFound     -> 0x01
+    ErrKeyExists       -> 0x02
+    ErrValueTooLarge   -> 0x03
+    ErrInvalidArgs     -> 0x04
+    ErrItemNotStored   -> 0x05
+    ErrValueNonNumeric -> 0x06
+    ErrUnknownCommand  -> 0x81
+    ErrOutOfMemory     -> 0x82
+    SaslAuthFail       -> 0x20
+    SaslAuthContinue   -> 0x21
 
 -- | Check the length of a header field is as expected, throwing a
 -- ProtocolError exception if it is not.

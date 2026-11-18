@@ -7,13 +7,16 @@ module Main where
 import           MockServer
 
 import qualified Database.Memcache.Client as M
+import           Database.Memcache.Cluster (getAliveServers, orderServersForKey)
 import           Database.Memcache.Errors
+import           Database.Memcache.Server (newServerDefault)
 import           Database.Memcache.Socket
 import           Database.Memcache.Types
 
 import           Control.Exception
 import           Control.Monad
 import qualified Data.ByteString.Char8    as BC
+import qualified Data.Map.Strict          as Map
 import           System.Exit
 
 main :: IO ()
@@ -32,6 +35,18 @@ main = do
     putStrLn "PASSED"
     putStr "TIMEOUT2: "
     timeoutRetryTest
+    putStrLn "PASSED"
+    putStr "GETMULTI: "
+    getFirstMultiTest
+    putStrLn "PASSED"
+    putStr "GETCHUNKS:"
+    getFirstMultiChunksTest
+    putStrLn "PASSED"
+    putStr "GETMULTI2:"
+    getFirstMultiFallbackTest
+    putStrLn "PASSED"
+    putStr "SETMULTI: "
+    setAllMultiTest
     putStrLn "PASSED"
     exitSuccess
 
@@ -94,4 +109,65 @@ timeoutRetryTest = withMCServer False res $ do
   where
     res = [ DelayMS 800 Noop
           , MR $ emptyRes { resOp = ResSet Loud }
+          ]
+
+getFirstMultiTest :: IO ()
+getFirstMultiTest = withMCServer False res $ do
+    c <- M.newClient [M.def] M.def
+    r <- M.getFirstMulti c ["a", "b", "c"]
+    let expected = Map.fromList [("a", ("va", 1, 11)), ("c", ("vc", 3, 33))]
+    when (r /= expected) $ do
+        putStrLn $ "bad result! " ++ show r
+        exitFailure
+  where
+    res = [ MR $ emptyRes { resOp = ResGetK Quiet "a" "va" 1, resCas = 11 }
+          , Noop
+          , MR $ emptyRes { resOp = ResGetK Quiet "c" "vc" 3, resCas = 33 }
+          , MR emptyRes
+          ]
+
+getFirstMultiChunksTest :: IO ()
+getFirstMultiChunksTest = withMCServer False res $ do
+    c <- M.newClient [M.def] M.def
+    r <- M.getFirstMulti c ks
+    when (r /= expected) $ do
+        putStrLn $ "bad result! " ++ show (Map.size r) ++ " keys"
+        exitFailure
+  where
+    ks = BC.pack . show <$> [1 .. 150 :: Int]
+    expected = Map.fromList [(k, (k, 0, 0)) | k <- ks]
+    hit k = MR $ emptyRes { resOp = ResGetK Quiet k k 0 }
+    res = (hit <$> take 100 ks) <> [MR emptyRes] <> (hit <$> drop 100 ks) <> [MR emptyRes]
+
+getFirstMultiFallbackTest :: IO ()
+getFirstMultiFallbackTest = do
+    c <- M.newClient [spec1, spec2] M.def
+    servers <- getAliveServers c
+    s1 <- newServerDefault spec1
+    let k = head [k' | k' <- BC.pack . show <$> [0 :: Int ..], head (orderServersForKey servers k') == s1]
+        hit = [MR $ emptyRes { resOp = ResGetK Quiet k "v" 0, resCas = 7 }, MR emptyRes]
+    withMCServerOn "11211" False [Noop, MR emptyRes] $
+      withMCServerOn "11212" False hit $ do
+        r <- M.getFirstMulti c [k]
+        when (r /= Map.fromList [(k, ("v", 0, 7))]) $ do
+            putStrLn $ "bad result! " ++ show r
+            exitFailure
+  where
+    spec1 = M.def
+    spec2 = M.def { M.ssPort = "11212" }
+
+setAllMultiTest :: IO ()
+setAllMultiTest = withMCServer False res $ do
+    c <- M.newClient [M.def] M.def
+    r <- M.setAllMulti c [("a", "va", 0, 0), ("b", "vb", 0, 0), ("c", "vc", 0, 0)]
+    case r of
+        [Right [("b", ErrValueTooLarge)]] -> return ()
+        _ -> do
+            putStrLn $ "bad result! " ++ show r
+            exitFailure
+  where
+    res = [ Noop
+          , MR $ emptyRes { resOp = ResSet Quiet, resStatus = ErrValueTooLarge, resOpaque = 1 }
+          , Noop
+          , MR emptyRes
           ]
