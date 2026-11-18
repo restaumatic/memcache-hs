@@ -39,6 +39,9 @@ main = do
     putStr "GETMULTI: "
     getFirstMultiTest
     putStrLn "PASSED"
+    putStr "GETCHUNKS:"
+    getFirstMultiChunksTest
+    putStrLn "PASSED"
     putStr "GETMULTI2:"
     getFirstMultiFallbackTest
     putStrLn "PASSED"
@@ -122,6 +125,19 @@ getFirstMultiTest = withMCServer False res $ do
           , MR $ emptyRes { resOp = ResGetK Quiet "c" "vc" 3, resCas = 33 }
           , MR emptyRes
           ]
+
+getFirstMultiChunksTest :: IO ()
+getFirstMultiChunksTest = withMCServer False res $ do
+    c <- M.newClient [M.def] M.def
+    r <- M.getFirstMulti c ks
+    when (r /= expected) $ do
+        putStrLn $ "bad result! " ++ show (Map.size r) ++ " keys"
+        exitFailure
+  where
+    ks = BC.pack . show <$> [1 .. 150 :: Int]
+    expected = Map.fromList [(k, (k, 0, 0)) | k <- ks]
+    hit k = MR $ emptyRes { resOp = ResGetK Quiet k k 0 }
+    res = (hit <$> take 100 ks) <> [MR emptyRes] <> (hit <$> drop 100 ks) <> [MR emptyRes]
 
 getFirstMultiFallbackTest :: IO ()
 getFirstMultiFallbackTest = do
